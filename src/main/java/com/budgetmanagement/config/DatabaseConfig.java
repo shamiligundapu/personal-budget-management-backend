@@ -8,6 +8,7 @@ import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
+import org.springframework.core.env.Environment;
 
 import javax.sql.DataSource;
 import java.net.URI;
@@ -20,16 +21,28 @@ public class DatabaseConfig {
 
     private static final Logger logger = LoggerFactory.getLogger(DatabaseConfig.class);
 
+    private final Environment environment;
+
+    public DatabaseConfig(Environment environment) {
+        this.environment = environment;
+    }
+
     @Bean
     @Primary
     public DataSource dataSource(DataSourceProperties properties) {
-        String rawUrl = properties.getUrl();
-        String username = properties.getUsername();
-        String password = properties.getPassword();
+        boolean isLocalOrTest = isLocalOrTestProfile();
 
-        if (rawUrl == null || rawUrl.isBlank()) {
-            logger.warn("No database URL configured in DataSourceProperties, building default dataSource");
-            return properties.initializeDataSourceBuilder().type(HikariDataSource.class).build();
+        String rawUrl = resolveDatabaseUrl(environment, properties.getUrl());
+        String username = resolveUsername(environment, properties.getUsername());
+        String password = resolvePassword(environment, properties.getPassword());
+
+        // Validate production database configuration: H2 silent fallback is strictly forbidden in production
+        validateProductionUrl(rawUrl, isLocalOrTest);
+
+        if (isLocalOrTest && (rawUrl == null || rawUrl.isBlank())) {
+            rawUrl = "jdbc:h2:mem:budget_test;MODE=MySQL;NON_KEYWORDS=MONTH,YEAR;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE";
+            if (username == null || username.isBlank()) username = "sa";
+            if (password == null) password = "";
         }
 
         DbConnectionInfo info = parseAndNormalize(rawUrl, username, password, properties.getDriverClassName());
@@ -49,6 +62,7 @@ public class DatabaseConfig {
             config.setDriverClassName(info.driverClassName);
         }
 
+        // Production-safe connection pool settings
         config.setMaximumPoolSize(10);
         config.setMinimumIdle(2);
         config.setIdleTimeout(30000);
@@ -60,12 +74,120 @@ public class DatabaseConfig {
         return new HikariDataSource(config);
     }
 
+    public boolean isLocalOrTestProfile() {
+        if (environment == null) return false;
+        return environment.matchesProfiles("local", "test");
+    }
+
+    public static void validateProductionUrl(String rawUrl, boolean isLocalOrTest) {
+        if (!isLocalOrTest) {
+            if (rawUrl == null || rawUrl.isBlank()) {
+                throw new IllegalStateException(
+                        "Production database configuration failed: No database URL was found. " +
+                        "Railway requires 'DB_URL' (or 'DATABASE_URL') to be set to your Aiven MySQL connection string: " +
+                        "jdbc:mysql://<host>:<port>/<database>?sslMode=REQUIRED&allowPublicKeyRetrieval=true&serverTimezone=UTC. " +
+                        "Silent fallback to in-memory H2 is strictly disabled in production."
+                );
+            }
+
+            String trimmed = rawUrl.trim().toLowerCase();
+            if (trimmed.startsWith("jdbc:h2:") || trimmed.startsWith("h2:")) {
+                throw new IllegalStateException(
+                        "Production database configuration failed: In-memory/embedded H2 URL ('" + rawUrl + "') " +
+                        "is not permitted in production. Please configure 'DB_URL' with your Aiven MySQL connection string."
+                );
+            }
+        }
+    }
+
+    public static String resolveDatabaseUrl(Environment env, String propertiesUrl) {
+        String cleaned = cleanValue(propertiesUrl);
+        if (cleaned != null && !cleaned.isBlank()) {
+            return cleaned;
+        }
+
+        String[] candidateKeys = {"DB_URL", "DATABASE_URL", "MYSQL_URL", "SPRING_DATASOURCE_URL"};
+        for (String key : candidateKeys) {
+            if (env != null) {
+                String val = cleanValue(env.getProperty(key));
+                if (val != null && !val.isBlank()) {
+                    return val;
+                }
+            }
+            String envVal = cleanValue(System.getenv(key));
+            if (envVal != null && !envVal.isBlank()) {
+                return envVal;
+            }
+        }
+        return null;
+    }
+
+    public static String resolveUsername(Environment env, String propertiesUser) {
+        String cleaned = cleanValue(propertiesUser);
+        if (cleaned != null && !cleaned.isBlank() && !"root".equals(cleaned)) {
+            return cleaned;
+        }
+
+        String[] candidateKeys = {"DB_USERNAME", "DATABASE_USERNAME", "MYSQL_USER", "SPRING_DATASOURCE_USERNAME"};
+        for (String key : candidateKeys) {
+            if (env != null) {
+                String val = cleanValue(env.getProperty(key));
+                if (val != null && !val.isBlank()) {
+                    return val;
+                }
+            }
+            String envVal = cleanValue(System.getenv(key));
+            if (envVal != null && !envVal.isBlank()) {
+                return envVal;
+            }
+        }
+        return cleaned;
+    }
+
+    public static String resolvePassword(Environment env, String propertiesPass) {
+        String cleaned = cleanValue(propertiesPass);
+        if (cleaned != null && !cleaned.isBlank()) {
+            return cleaned;
+        }
+
+        String[] candidateKeys = {"DB_PASSWORD", "DATABASE_PASSWORD", "MYSQL_PASSWORD", "SPRING_DATASOURCE_PASSWORD"};
+        for (String key : candidateKeys) {
+            if (env != null) {
+                String val = cleanValue(env.getProperty(key));
+                if (val != null && !val.isBlank()) {
+                    return val;
+                }
+            }
+            String envVal = cleanValue(System.getenv(key));
+            if (envVal != null && !envVal.isBlank()) {
+                return envVal;
+            }
+        }
+        return cleaned;
+    }
+
+    public static String cleanValue(String val) {
+        if (val == null) return null;
+        String trimmed = val.trim();
+        if ((trimmed.startsWith("\"") && trimmed.endsWith("\"")) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+            if (trimmed.length() >= 2) {
+                trimmed = trimmed.substring(1, trimmed.length() - 1).trim();
+            }
+        }
+        return trimmed;
+    }
+
     public static DbConnectionInfo parseAndNormalize(String rawUrl, String defaultUser, String defaultPass, String defaultDriver) {
         String trimmed = rawUrl.trim();
 
-        // 1. If H2 or SQLite, return as is
-        if (trimmed.startsWith("jdbc:h2:") || trimmed.startsWith("jdbc:sqlite:")) {
-            return new DbConnectionInfo(trimmed, defaultUser, defaultPass, defaultDriver);
+        // 1. If H2 or SQLite (allowed only in local/test)
+        if (trimmed.startsWith("jdbc:h2:") || trimmed.startsWith("h2:")) {
+            String jdbcUrl = trimmed.startsWith("jdbc:") ? trimmed : "jdbc:" + trimmed;
+            return new DbConnectionInfo(jdbcUrl, defaultUser, defaultPass, "org.h2.Driver");
+        }
+        if (trimmed.startsWith("jdbc:sqlite:") || trimmed.startsWith("sqlite:")) {
+            String jdbcUrl = trimmed.startsWith("jdbc:") ? trimmed : "jdbc:" + trimmed;
+            return new DbConnectionInfo(jdbcUrl, defaultUser, defaultPass, "org.sqlite.JDBC");
         }
 
         // 2. Check if MySQL (starts with mysql:// or jdbc:mysql://)
@@ -73,23 +195,25 @@ public class DatabaseConfig {
         boolean isPostgres = trimmed.startsWith("postgres://") || trimmed.startsWith("postgresql://") || trimmed.startsWith("jdbc:postgresql://");
 
         if (isMysql) {
-            return normalizeMysql(trimmed, defaultUser, defaultPass, defaultDriver);
+            return normalizeMysql(trimmed, defaultUser, defaultPass);
         }
 
         if (isPostgres) {
-            return normalizePostgres(trimmed, defaultUser, defaultPass, defaultDriver);
+            return normalizePostgres(trimmed, defaultUser, defaultPass);
         }
 
-        return new DbConnectionInfo(trimmed, defaultUser, defaultPass, defaultDriver);
+        // Fallback: if driver not recognized, default to MySQL driver if not local/test
+        String driver = (defaultDriver != null && !defaultDriver.isBlank()) ? defaultDriver : "com.mysql.cj.jdbc.Driver";
+        return new DbConnectionInfo(trimmed, defaultUser, defaultPass, driver);
     }
 
-    private static DbConnectionInfo normalizeMysql(String rawUrl, String defaultUser, String defaultPass, String defaultDriver) {
+    private static DbConnectionInfo normalizeMysql(String rawUrl, String defaultUser, String defaultPass) {
         String extractedUser = defaultUser;
         String extractedPass = defaultPass;
 
         String withoutJdbc = rawUrl.startsWith("jdbc:") ? rawUrl.substring(5) : rawUrl;
 
-        // If it starts with mysql://, we can parse URI
+        // If it starts with mysql://, parse URI components
         if (withoutJdbc.startsWith("mysql://")) {
             try {
                 URI uri = URI.create(withoutJdbc);
@@ -116,15 +240,14 @@ public class DatabaseConfig {
 
                 String queryStr = buildQuery(params);
                 String jdbcUrl = "jdbc:mysql://" + host + ":" + port + path + (queryStr.isEmpty() ? "" : "?" + queryStr);
-                String driver = (defaultDriver != null && !defaultDriver.isBlank()) ? defaultDriver : "com.mysql.cj.jdbc.Driver";
 
-                return new DbConnectionInfo(jdbcUrl, extractedUser, extractedPass, driver);
+                return new DbConnectionInfo(jdbcUrl, extractedUser, extractedPass, "com.mysql.cj.jdbc.Driver");
             } catch (Exception ex) {
                 logger.warn("Failed to parse mysql URI via java.net.URI, applying fallback string normalization: {}", ex.getMessage());
             }
         }
 
-        // Fallback or already jdbc:mysql:// without userinfo
+        // Fallback or already jdbc:mysql://
         String jdbcUrl = rawUrl.startsWith("jdbc:mysql://") ? rawUrl : "jdbc:" + rawUrl;
 
         // Clean userinfo if present in jdbc:mysql://user:pass@host
@@ -152,12 +275,11 @@ public class DatabaseConfig {
 
         String queryStr = buildQuery(params);
         jdbcUrl = baseUrl + (queryStr.isEmpty() ? "" : "?" + queryStr);
-        String driver = (defaultDriver != null && !defaultDriver.isBlank()) ? defaultDriver : "com.mysql.cj.jdbc.Driver";
 
-        return new DbConnectionInfo(jdbcUrl, extractedUser, extractedPass, driver);
+        return new DbConnectionInfo(jdbcUrl, extractedUser, extractedPass, "com.mysql.cj.jdbc.Driver");
     }
 
-    private static DbConnectionInfo normalizePostgres(String rawUrl, String defaultUser, String defaultPass, String defaultDriver) {
+    private static DbConnectionInfo normalizePostgres(String rawUrl, String defaultUser, String defaultPass) {
         String extractedUser = defaultUser;
         String extractedPass = defaultPass;
 
@@ -187,16 +309,14 @@ public class DatabaseConfig {
                 }
                 String query = uri.getQuery();
                 String jdbcUrl = "jdbc:postgresql://" + host + ":" + port + path + (query != null && !query.isBlank() ? "?" + query : "");
-                String driver = (defaultDriver != null && !defaultDriver.isBlank()) ? defaultDriver : "org.postgresql.Driver";
-                return new DbConnectionInfo(jdbcUrl, extractedUser, extractedPass, driver);
+                return new DbConnectionInfo(jdbcUrl, extractedUser, extractedPass, "org.postgresql.Driver");
             } catch (Exception ex) {
                 logger.warn("Failed to parse postgresql URI: {}", ex.getMessage());
             }
         }
 
         String jdbcUrl = rawUrl.startsWith("jdbc:postgresql://") ? rawUrl : "jdbc:" + rawUrl;
-        String driver = (defaultDriver != null && !defaultDriver.isBlank()) ? defaultDriver : "org.postgresql.Driver";
-        return new DbConnectionInfo(jdbcUrl, extractedUser, extractedPass, driver);
+        return new DbConnectionInfo(jdbcUrl, extractedUser, extractedPass, "org.postgresql.Driver");
     }
 
     private static void normalizeMysqlParams(Map<String, String> params) {
@@ -228,7 +348,7 @@ public class DatabaseConfig {
                 .collect(Collectors.joining("&"));
     }
 
-    private static String sanitizeForLog(String url) {
+    public static String sanitizeForLog(String url) {
         if (url == null) return "null";
         return url.replaceAll("(?i)(password|pwd|secret)=[^&]*", "$1=***");
     }
