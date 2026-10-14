@@ -99,4 +99,15 @@ class DatabaseConfigTest {
         assertEquals("plain", DatabaseConfig.cleanValue("  plain  "));
         assertNull(DatabaseConfig.cleanValue(null));
     }
+
+    @Test
+    void testNormalizeAivenJdbcUrlWithoutDbNameAppendsDefaultdb() {
+        String urlWithoutDb = "jdbc:mysql://mysql-test.aivencloud.com:12345?sslMode=REQUIRED";
+        DatabaseConfig.DbConnectionInfo info = DatabaseConfig.parseAndNormalize(urlWithoutDb, "avnadmin", "secretPass", null);
+
+        assertNotNull(info);
+        assertTrue(info.jdbcUrl.startsWith("jdbc:mysql://mysql-test.aivencloud.com:12345/defaultdb"));
+        assertTrue(info.jdbcUrl.contains("sslMode=REQUIRED"));
+    }
 }
+

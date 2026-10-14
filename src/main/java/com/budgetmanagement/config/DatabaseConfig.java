@@ -47,6 +47,15 @@ public class DatabaseConfig {
 
         DbConnectionInfo info = parseAndNormalize(rawUrl, username, password, properties.getDriverClassName());
 
+        if (!isLocalOrTest && info.jdbcUrl != null && info.jdbcUrl.contains("aivencloud.com")) {
+            if (info.password == null || info.password.isBlank()) {
+                throw new IllegalStateException(
+                        "Production database configuration failed: Missing database password for Aiven MySQL. " +
+                        "Please set 'DB_PASSWORD' (or 'DATABASE_PASSWORD') in Railway service variables."
+                );
+            }
+        }
+
         logger.info("Initializing HikariDataSource with driver: {} and target: {}",
                 info.driverClassName, sanitizeForLog(info.jdbcUrl));
 
@@ -269,6 +278,13 @@ public class DatabaseConfig {
         int qIdx = jdbcUrl.indexOf("?");
         String baseUrl = qIdx >= 0 ? jdbcUrl.substring(0, qIdx) : jdbcUrl;
         String rawQuery = qIdx >= 0 ? jdbcUrl.substring(qIdx + 1) : "";
+
+        // Ensure database name is present in baseUrl
+        int schemeEnd = baseUrl.indexOf("://") + 3;
+        int pathSlash = baseUrl.indexOf("/", schemeEnd);
+        if (pathSlash < 0 || pathSlash == baseUrl.length() - 1) {
+            baseUrl = (pathSlash < 0 ? baseUrl : baseUrl.substring(0, pathSlash)) + "/defaultdb";
+        }
 
         Map<String, String> params = parseQuery(rawQuery);
         normalizeMysqlParams(params);
